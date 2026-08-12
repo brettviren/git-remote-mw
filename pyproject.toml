@@ -8,9 +8,12 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = []
+license = "GPL-2.0-or-later"
+license-files = ["COPYING"]
 
 [build-system]
-requires = ["setuptools>=61"]
+# 77 or newer for the PEP 639 license expression above.
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 # git-remote-mw is a single stand-alone script (git needs to find it on PATH

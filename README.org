@@ -45,8 +45,9 @@ name:
   ln -s "$PWD/git-remote-mw" ~/.local/bin/git-remote-mw
 #+end_src
 
-If you do not want the =uv= shebang, drop it and use =#!/usr/bin/env python3=,
-or install into git's exec path (=git --exec-path=) instead.
+Installing into git's exec path (=git --exec-path=) works as well.  The
+shebang is =#!/usr/bin/env python=, so whatever =python= that finds must be
+3.12 or newer.
 
 * URL syntax
 
@@ -256,4 +257,9 @@ The fake wiki is also runnable on its own for manual poking:
 
 * License
 
-GPL v2 or later, as the Perl implementation this is derived from.
+GPL v2 or later (=SPDX-License-Identifier: GPL-2.0-or-later=), as the Perl
+implementation this is derived from.  The full text is in the [[file:COPYING][COPYING]] file.
+
+Copyright (C) 2026 Brett Viren.  Derived from git-remote-mediawiki, copyright
+(C) 2011 Jérémie Nikaes, Arnaud Lacurie, Claire Fousse, David Amouyal and
+Matthieu Moy.
