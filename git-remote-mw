@@ -1,0 +1,14 @@
+#!/usr/bin/env -S uv run --script
+# -*- python -*-
+# /// script
+# requires-python = ">=3.12"
+# dependencies = []
+# ///
+
+
+def main() -> None:
+    print("Hello from git-remote-mw!")
+
+
+if __name__ == "__main__":
+    main()

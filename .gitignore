@@ -1,0 +1,4 @@
+.claude
+*.py[co]
+__pycache__
+reference
