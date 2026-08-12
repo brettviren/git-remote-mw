@@ -1,13 +1,2002 @@
-#!/usr/bin/env -S uv run --script
-# -*- python -*-
-# /// script
-# requires-python = ">=3.12"
-# dependencies = []
-# ///
+#!/usr/bin/env python
+"""Gateway between Git and MediaWiki: a git remote helper.
+
+    git clone mw::https://example.com/wiki
+
+This is a Python re-implementation of the Perl ``git-remote-mediawiki''.  It
+speaks the MediaWiki Action API using nothing but the Python standard library.
+
+Wiki pages are mapped to files named "<Page_title>.mw".  Each MediaWiki
+revision becomes one Git commit on refs/mediawiki/<remote>/master, and the
+MediaWiki revision id of each commit is recorded in a Git note in
+refs/notes/<remote>/mediawiki so that later fetches know where to resume.
+
+Configuration (all optional, see also README.org):
+
+    remote.<name>.pages            space separated page titles to track
+    remote.<name>.categories       space separated categories to track
+    remote.<name>.namespaces       space separated namespaces to track
+    remote.<name>.shallow          import only the last revision of each page
+    remote.<name>.fetchStrategy    "by_page" (default) or "by_rev"
+    remote.<name>.mediaimport      import media files on fetch (default false)
+    remote.<name>.mediaexport      export media files on push (default true)
+    remote.<name>.mwLogin          wiki user name (password via credential API)
+    remote.<name>.mwPassword       wiki password (discouraged, use credentials)
+    remote.<name>.mwDomain         wiki login domain (LDAP & friends)
+    remote.<name>.dumbPush         do not update notes/refs on push
+    mediawiki.fetchStrategy        fallback for remote.<name>.fetchStrategy
+    mediawiki.dumbPush             fallback for remote.<name>.dumbPush
+"""
+
+from __future__ import annotations
+
+import gzip
+import http.client
+import http.cookiejar
+import json
+import os
+import re
+import ssl
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+from datetime import datetime, timedelta, timezone
+
+VERSION = "0.1.0"
+USER_AGENT = f"git-remote-mw/{VERSION} python-urllib/{sys.version_info[0]}"
+
+# MediaWiki filenames can contain forward slashes.  This is what they are
+# replaced with on the Git side.
+SLASH_REPLACEMENT = "%2F"
+
+# It's not always possible to delete pages (may require some privileges).
+# Deleted pages are replaced with this content.
+DELETED_CONTENT = "[[Category:Deleted]]\n"
+
+# It's not possible to create empty pages.  New empty files in Git are sent
+# with this content instead.
+EMPTY_CONTENT = "<!-- empty page -->\n"
+
+# Stand-in for a revision whose content the wiki refuses to hand out.
+SUPPRESSED_REVISION = "<!-- suppressed revision -->\n"
+
+# Used on Git's side to reflect empty edit messages on the wiki.
+EMPTY_MESSAGE = "*Empty MediaWiki Message*"
+
+# Used to reflect file creation or deletion in diff.
+NULL_SHA1 = "0" * 40
+
+# Number of page titles asked for at once in get_mw_page_list().
+SLICE_SIZE = 50
+
+# Number of pages whose linked mediafiles are queried at once.  The query is
+# split in small batches because of the MW API limit on the number of links
+# to be returned (500 links max).
+BATCH_SIZE = 10
+
+# Number of revision ids fetched with one API query: the API limit is 50, or
+# 500 for an account with the apihighlimits right (bots and, usually, admins).
+MAX_REVIDS = 50
+MAX_REVIDS_HIGH = 500
+
+# Longest file name component allowed by POSIX file systems.
+NAME_MAX = 255
+
+HTTP_TIMEOUT = 60
+HTTP_CODE_OK = 200
+
+# The one tree that is not in any repository but that git always knows about.
+EMPTY_TREE_SHA1 = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+
+
+# --------------------------------------------------------------------------
+# output helpers
+# --------------------------------------------------------------------------
+
+# Everything Git reads from us (remote-helper answers *and* the fast-import
+# stream, which may carry binary media files) goes to stdout as bytes.
+OUT = sys.stdout.buffer
+
+VERBOSITY = 1
+
+
+def out(text: str) -> None:
+    OUT.write(text.encode("utf-8"))
+
+
+def out_flush() -> None:
+    OUT.flush()
+
+
+def warn(text: str) -> None:
+    """Unconditional message to the user."""
+    sys.stderr.write(text + "\n")
+    sys.stderr.flush()
+
+
+def log(text: str) -> None:
+    """Progress message, silenced by `git <cmd> --quiet'."""
+    if VERBOSITY >= 1:
+        warn(text)
+
+
+def debug(text: str) -> None:
+    """Message only wanted with `git <cmd> --verbose'."""
+    if VERBOSITY >= 2:
+        warn(text)
+
+
+def die(text: str) -> "NoReturn":  # noqa: F821
+    warn(text)
+    sys.exit(1)
+
+
+def literal_data(content: str) -> None:
+    data = content.encode("utf-8")
+    out(f"data {len(data)}\n")
+    OUT.write(data)
+
+
+def literal_data_raw(content: bytes) -> None:
+    """Output possibly binary content."""
+    out(f"data {len(content)}\n")
+    OUT.write(content)
+
+
+# --------------------------------------------------------------------------
+# git plumbing
+# --------------------------------------------------------------------------
+
+
+def git_bytes(args: list[str], quiet_stderr: bool = False) -> bytes:
+    """Run git and return its raw stdout ("" if the command failed)."""
+    proc = subprocess.run(
+        ["git", *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL if quiet_stderr else None,
+        check=False,
+    )
+    return proc.stdout
+
+
+def git(args: list[str], quiet_stderr: bool = False) -> str:
+    return git_bytes(args, quiet_stderr).decode("utf-8", "replace")
+
+
+def git_config(key: str, boolean: bool = False) -> str:
+    args = ["config", "--get"]
+    if boolean:
+        args.append("--bool")
+    return git(args + [key], quiet_stderr=True).strip()
+
+
+def git_config_bool(key: str, default: bool = False) -> bool:
+    value = git_config(key, boolean=True)
+    if not value:
+        return default
+    return value == "true"
+
+
+def git_config_list(key: str) -> list[str]:
+    """Values of a multi-valued config, split on whitespace.
+
+    Accept both space-separated and multiple keys in the config file.
+    """
+    raw = git(["config", "--get-all", key], quiet_stderr=True)
+    return [item for item in raw.split() if item]
+
+
+def git_credential(cred: dict[str, str], operation: str = "fill") -> dict[str, str]:
+    """Talk to git's credential API."""
+    request = "".join(f"{k}={v}\n" for k, v in cred.items() if v) + "\n"
+    proc = subprocess.run(
+        ["git", "credential", operation],
+        input=request.encode("utf-8"),
+        stdout=subprocess.PIPE if operation == "fill" else subprocess.DEVNULL,
+        check=False,
+    )
+    if operation != "fill":
+        return cred
+    filled = dict(cred)
+    for line in proc.stdout.decode("utf-8", "replace").splitlines():
+        key, _, value = line.partition("=")
+        if key:
+            filled[key] = value
+    return filled
+
+
+def empty_tree() -> str:
+    """The empty tree object, created on demand for diffs of root commits."""
+    sha1 = subprocess.run(
+        ["git", "hash-object", "-w", "-t", "tree", "--stdin"],
+        input=b"",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    ).stdout.decode().strip()
+    return sha1 or EMPTY_TREE_SHA1
+
+
+# --------------------------------------------------------------------------
+# file name mangling
+# --------------------------------------------------------------------------
+
+
+def clean_filename(filename: str) -> str:
+    """Git file name -> MediaWiki page title."""
+    filename = filename.replace(SLASH_REPLACEMENT, "/")
+    # [, ], |, {, and } are forbidden by MediaWiki, even URL-encoded.  Do a
+    # variant of URL-encoding, i.e. looks like URL-encoding, but with _ added
+    # to prevent MediaWiki from thinking this is an actual special character.
+    return re.sub(r"[\[\]{}|]", lambda m: "_%%_%x" % ord(m.group(0)), filename)
+
+
+def smudge_filename(filename: str) -> str:
+    """MediaWiki page title -> Git file name (without the .mw suffix)."""
+    filename = filename.replace("/", SLASH_REPLACEMENT).replace(" ", "_")
+    # Decode forbidden characters encoded in clean_filename().
+    filename = re.sub(
+        r"_%_([0-9a-fA-F]{2})", lambda m: chr(int(m.group(1), 16)), filename
+    )
+    limit = NAME_MAX - len(".mw")
+    filename = filename[:limit]
+    while len(filename.encode("utf-8")) > limit:
+        filename = filename[:-1]
+    return filename
+
+
+def mediawiki_clean(text: str, page_created: bool) -> str:
+    """Clean content before sending it to MediaWiki.
+
+    MediaWiki does not allow blank space at the end of a page and ends with a
+    single \\n, so right trim and add one \\n.
+    """
+    text = text.rstrip()
+    if not text and page_created:
+        # Creating empty pages is forbidden.
+        text = EMPTY_CONTENT.rstrip()
+    return text + "\n"
+
+
+def mediawiki_smudge(text: str) -> str:
+    """Filter applied on MediaWiki data before adding them to Git."""
+    # MediaWiki right trims what it stores, so compare trimmed.
+    if text.strip() == EMPTY_CONTENT.strip():
+        text = ""
+    # This \n is important.  This is due to mediawiki's way to handle end of
+    # files.
+    return text + "\n"
+
+
+def fe_escape_path(path: str) -> str:
+    """Quote a path for the fast-import stream."""
+    path = path.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+    return f'"{path}"'
+
+
+def sanitize_ident(name: str) -> str:
+    """Make a string usable inside a fast-import identity."""
+    return re.sub(r"[<>\n]", "_", name).strip() or "Anonymous"
+
+
+# --------------------------------------------------------------------------
+# MediaWiki Action API
+# --------------------------------------------------------------------------
+
+
+class MWError(Exception):
+    def __init__(self, code: str, info: str):
+        super().__init__(f"{code}: {info}")
+        self.code = code
+        self.info = info
+
+
+def page_list(result: dict) -> list[dict]:
+    """The pages of a query result, for either API formatversion."""
+    pages = (result.get("query") or {}).get("pages")
+    if not pages:
+        return []
+    if isinstance(pages, dict):  # formatversion=1
+        return list(pages.values())
+    return pages
+
+
+def revision_content(rev: dict) -> str | None:
+    """Wikitext of a revision, for either API formatversion, or None."""
+    slots = rev.get("slots")
+    if slots:
+        main = slots.get("main") or {}
+        content = main.get("content", main.get("*"))
+    else:
+        content = rev.get("content", rev.get("*"))
+    return content if isinstance(content, str) else None
+
+
+def message_text(message) -> str:
+    """Readable text out of an API message, which may be a structured one."""
+    if isinstance(message, dict):
+        return str(message.get("text") or message.get("code") or message)
+    return str(message) if message else ""
+
+
+def continuation(result: dict) -> dict | None:
+    """Parameters to add to the next query, or None when done."""
+    if "continue" in result:  # modern API
+        return dict(result["continue"])
+    if "query-continue" in result:  # legacy API
+        params: dict = {}
+        for module in result["query-continue"].values():
+            params.update(module)
+        return params
+    return None
+
+
+class Transport:
+    """HTTP with the two things urllib will not do: keep-alive and gzip.
+
+    An import is hundreds of round trips to the same host, so paying for a
+    fresh TCP (and TLS) handshake every time is worth avoiding, as is
+    transferring wikitext uncompressed.
+    """
+
+    MAX_REDIRECTS = 5
+    REDIRECTS = (301, 302, 303, 307, 308)
+
+    def __init__(self, user_agent: str = USER_AGENT):
+        self.user_agent = user_agent
+        self.cookies = http.cookiejar.CookieJar()
+        self.connections: dict[tuple, http.client.HTTPConnection] = {}
+        self._ssl_context: ssl.SSLContext | None = None
+
+    def ssl_context(self) -> ssl.SSLContext:
+        """Verification set up the way git's own http.* config asks for."""
+        if self._ssl_context is None:
+            ca_info = git_config("http.sslCAInfo") or os.environ.get("GIT_SSL_CAINFO")
+            context = ssl.create_default_context(cafile=ca_info or None)
+            no_verify = os.environ.get("GIT_SSL_NO_VERIFY")
+            if git_config("http.sslVerify", boolean=True) == "false" or (
+                no_verify and no_verify not in ("0", "false")
+            ):
+                warn("warning: SSL certificate verification is disabled")
+                context.check_hostname = False
+                context.verify_mode = ssl.CERT_NONE
+            self._ssl_context = context
+        return self._ssl_context
+
+    def _connection(self, parts) -> tuple[tuple, http.client.HTTPConnection, bool]:
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+        key = (parts.scheme, parts.hostname, port)
+        conn = self.connections.get(key)
+        if conn is not None:
+            return key, conn, True
+        if parts.scheme == "https":
+            conn = http.client.HTTPSConnection(
+                parts.hostname, port, timeout=HTTP_TIMEOUT, context=self.ssl_context()
+            )
+        else:
+            conn = http.client.HTTPConnection(
+                parts.hostname, port, timeout=HTTP_TIMEOUT
+            )
+        self.connections[key] = conn
+        return key, conn, False
+
+    def _drop(self, key: tuple, conn: http.client.HTTPConnection) -> None:
+        conn.close()
+        if self.connections.get(key) is conn:
+            del self.connections[key]
+
+    def close(self) -> None:
+        for key in list(self.connections):
+            self._drop(key, self.connections[key])
+
+    def request(
+        self,
+        url: str,
+        data: bytes | None = None,
+        content_type: str | None = None,
+        redirects: int = 0,
+    ) -> tuple[int, bytes]:
+        """Perform one exchange, returning (status, body).
+
+        Raises MWError("network", ...) if the exchange could not be made.  A
+        request that may already have reached the server is never repeated
+        behind the caller's back unless it is a GET.
+        """
+        parts = urllib.parse.urlsplit(url)
+        method = "GET" if data is None else "POST"
+        target = urllib.parse.urlunsplit(("", "", parts.path or "/", parts.query, ""))
+
+        headers = {
+            "User-Agent": self.user_agent,
+            "Accept-Encoding": "gzip",
+            "Connection": "keep-alive",
+        }
+        if data is not None:
+            headers["Content-Type"] = (
+                content_type or "application/x-www-form-urlencoded"
+            )
+            headers["Content-Length"] = str(len(data))
+        # Let the cookie jar add (and later collect) session cookies.
+        cookie_carrier = urllib.request.Request(url, data=data, headers=headers)
+        self.cookies.add_cookie_header(cookie_carrier)
+        headers = dict(cookie_carrier.header_items())
+
+        for attempt in (0, 1):
+            key, conn, reused = self._connection(parts)
+            try:
+                conn.request(method, target, body=data, headers=headers)
+            except (http.client.HTTPException, OSError) as exc:
+                # Typically a pooled connection the server closed meanwhile:
+                # the request was not delivered, so it is safe to redo it.
+                self._drop(key, conn)
+                if reused and attempt == 0:
+                    continue
+                raise MWError("network", f"{method} {url}: {exc}") from exc
+            try:
+                resp = conn.getresponse()
+                body = resp.read()
+            except (http.client.HTTPException, OSError) as exc:
+                self._drop(key, conn)
+                # The server may have acted on a POST already; only a GET can
+                # be replayed safely.
+                if method == "GET" and reused and attempt == 0:
+                    continue
+                raise MWError("network", f"{method} {url}: {exc}") from exc
+            break
+
+        self.cookies.extract_cookies(resp, cookie_carrier)
+        if resp.will_close:
+            self._drop(key, conn)
+        if resp.getheader("Content-Encoding", "").lower() == "gzip" and body:
+            body = gzip.decompress(body)
+
+        location = resp.getheader("Location")
+        if resp.status in self.REDIRECTS and location:
+            if redirects >= self.MAX_REDIRECTS:
+                raise MWError("network", f"too many redirects for {url}")
+            # 303 (and, as everybody does it, 302) turn a POST into a GET.
+            follow_data = data if resp.status in (307, 308) else None
+            return self.request(
+                urllib.parse.urljoin(url, location),
+                follow_data,
+                content_type if follow_data is not None else None,
+                redirects + 1,
+            )
+        return resp.status, body
+
+
+class MediaWiki:
+    """Just enough of the MediaWiki Action API."""
+
+    # Status codes worth a second try; a POST is never retried, as the wiki
+    # may have acted on it already.
+    TRANSIENT = (429, 500, 502, 503, 504)
+
+    def __init__(self, url: str, transport: Transport | None = None):
+        url = url.rstrip("/")
+        if url.endswith("/api.php"):
+            self.api_url = url
+            self.url = url[: -len("/api.php")]
+        else:
+            self.url = url
+            self.api_url = url + "/api.php"
+        self.transport = transport or Transport()
+        self._csrf: str | None = None
+        self._high_limits: bool | None = None
+
+    # -- transport ---------------------------------------------------------
+
+    def fetch(
+        self, url: str, data: bytes | None = None, content_type: str | None = None
+    ) -> tuple[int, bytes]:
+        for attempt in range(3):
+            status, body = self.transport.request(url, data, content_type)
+            if status in self.TRANSIENT and data is None and attempt < 2:
+                time.sleep(1 + attempt)
+                continue
+            return status, body
+        return status, body
+
+    def api(self, params: dict, post: bool = False) -> dict:
+        """One API call.  Raises MWError on an API level error."""
+        query = {}
+        for key, value in params.items():
+            if value is None or value is False:
+                continue
+            query[key] = "1" if value is True else str(value)
+        query.setdefault("format", "json")
+        query.setdefault("formatversion", "2")
+        body = urllib.parse.urlencode(query, encoding="utf-8")
+
+        if post or len(body) > 4000:
+            status, raw = self.fetch(self.api_url, data=body.encode("utf-8"))
+        else:
+            status, raw = self.fetch(f"{self.api_url}?{body}")
+        if not raw:
+            raise MWError(f"http-{status}", "empty answer from the API")
+        return self._answer(raw)
+
+    @staticmethod
+    def _answer(raw: bytes) -> dict:
+        """Decode an API answer, turning an API error into an exception."""
+        try:
+            result = json.loads(raw.decode("utf-8"))
+        except ValueError as exc:
+            raise MWError("unparseable", f"{exc}: {raw[:200]!r}") from exc
+        if not isinstance(result, dict):
+            raise MWError("unparseable", f"unexpected API answer {result!r}")
+
+        error = result.get("error")
+        if error:
+            raise MWError(
+                str(error.get("code", "unknown")),
+                str(error.get("info", error.get("*", error))),
+            )
+        return result
+
+    def query_list(self, params: dict, key: str):
+        """Iterate over all items of a list= query, following continuations."""
+        params = dict(params, action="query")
+        params.setdefault("continue", "")
+        while True:
+            result = self.api(params)
+            for item in (result.get("query") or {}).get(key) or []:
+                yield item
+            cont = continuation(result)
+            if not cont:
+                return
+            params.update(cont)
+
+    def download(self, url: str) -> bytes | None:
+        try:
+            status, body = self.fetch(url)
+        except MWError as exc:
+            warn(f"Error downloading {url}: {exc.info}")
+            return None
+        if status != HTTP_CODE_OK:
+            warn(f"Server response: {status}")
+            return None
+        return body
+
+    # -- authentication ----------------------------------------------------
+
+    def login(self, name: str, password: str, domain: str = "") -> None:
+        """Log in, raising MWError if the wiki says no."""
+        try:
+            token = self.token("login")
+        except MWError:
+            token = None
+        if token is None:
+            # Really old wikis hand out the login token in a first, failing,
+            # login attempt.
+            first = self.api({"action": "login", "lgname": name}, post=True)
+            token = (first.get("login") or {}).get("token")
+
+        result = self.api(
+            {
+                "action": "login",
+                "lgname": name,
+                "lgpassword": password,
+                "lgdomain": domain or None,
+                "lgtoken": token,
+            },
+            post=True,
+        )
+        answer = result.get("login") or {}
+        if answer.get("result") == "Success":
+            return
+
+        # action=login only accepts bot passwords on modern wikis; the
+        # interactive login module accepts a normal one.
+        reason = message_text(answer.get("reason")) or answer.get("result")
+        try:
+            result = self.api(
+                {
+                    "action": "clientlogin",
+                    "username": name,
+                    "password": password,
+                    "domain": domain or None,
+                    "logintoken": self.token("login"),
+                    "loginreturnurl": self.url or "http://localhost/",
+                    "rememberMe": "1",
+                },
+                post=True,
+            )
+        except MWError:
+            raise MWError(answer.get("result", "Failed"), str(reason or "login failed"))
+        client = result.get("clientlogin") or {}
+        if client.get("status") == "PASS":
+            return
+        raise MWError(
+            str(client.get("status") or answer.get("result") or "Failed"),
+            message_text(client.get("message")) or reason or "login failed",
+        )
+
+    def token(self, kind: str = "csrf") -> str | None:
+        result = self.api({"action": "query", "meta": "tokens", "type": kind})
+        tokens = (result.get("query") or {}).get("tokens") or {}
+        token = tokens.get(f"{kind}token")
+        if token:
+            return token
+        # Legacy API (MediaWiki < 1.24).
+        legacy = {"csrf": "edit"}.get(kind, kind)
+        try:
+            result = self.api({"action": "tokens", "type": legacy})
+        except MWError:
+            return None
+        return (result.get("tokens") or {}).get(f"{legacy}token")
+
+    def csrf_token(self) -> str:
+        if self._csrf is None:
+            token = self.token("csrf")
+            if not token:
+                raise MWError("notoken", "could not obtain an edit token")
+            self._csrf = token
+        return self._csrf
+
+    def write(self, params: dict) -> dict:
+        """POST a request that needs an edit token, refreshing a stale one."""
+        for attempt in (0, 1):
+            try:
+                return self.api(dict(params, token=self.csrf_token()), post=True)
+            except MWError as exc:
+                if attempt == 0 and exc.code in (
+                    "badtoken",
+                    "notoken",
+                    "assertuserfailed",
+                ):
+                    self._csrf = None
+                    continue
+                raise
+        raise AssertionError("unreachable")
+
+    def upload(self, filename: str, content: bytes, comment: str) -> dict:
+        """action=upload, which needs multipart/form-data."""
+        for attempt in (0, 1):
+            fields = {
+                "action": "upload",
+                "format": "json",
+                "formatversion": "2",
+                "filename": filename,
+                "comment": comment,
+                "ignorewarnings": "1",
+                "token": self.csrf_token(),
+            }
+            body, content_type = encode_multipart(
+                fields, [("file", filename, content)]
+            )
+            _status, raw = self.fetch(self.api_url, data=body, content_type=content_type)
+            try:
+                return self._answer(raw)
+            except MWError as exc:
+                if attempt == 0 and exc.code in ("badtoken", "notoken"):
+                    self._csrf = None
+                    continue
+                raise
+        raise AssertionError("unreachable")
+
+
+def encode_multipart(
+    fields: dict[str, str], files: list[tuple[str, str, bytes]]
+) -> tuple[bytes, str]:
+    boundary = "git-remote-mw-" + os.urandom(16).hex()
+    body = bytearray()
+    for name, value in fields.items():
+        body += f"--{boundary}\r\n".encode()
+        body += f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode()
+        body += value.encode("utf-8") + b"\r\n"
+    for name, filename, content in files:
+        body += f"--{boundary}\r\n".encode()
+        body += (
+            f'Content-Disposition: form-data; name="{name}"; filename="{filename}"\r\n'
+        ).encode("utf-8")
+        body += b"Content-Type: application/octet-stream\r\n\r\n"
+        body += content + b"\r\n"
+    body += f"--{boundary}--\r\n".encode()
+    return bytes(body), f"multipart/form-data; boundary={boundary}"
+
+
+# --------------------------------------------------------------------------
+# the remote helper
+# --------------------------------------------------------------------------
+
+
+class Helper:
+    def __init__(self, remotename: str, url: str):
+        # Git passes either a configured remote name or, for a one-shot
+        # command such as `git ls-remote mw::<url>', the URL itself.  The
+        # former is what config keys are looked up under, the latter is not a
+        # valid piece of a ref name, hence the two spellings.
+        self.remotename = remotename
+        self.refname = ref_safe_name(remotename)
+        self.url = normalize_url(url)
+
+        # Accept both space-separated and multiple keys in config file.
+        self.tracked_pages = git_config_list(f"remote.{remotename}.pages")
+        self.tracked_categories = git_config_list(f"remote.{remotename}.categories")
+        self.tracked_namespaces = [
+            ns.replace("_", " ")
+            for ns in git_config_list(f"remote.{remotename}.namespaces")
+        ]
+
+        self.import_media = git_config_bool(f"remote.{remotename}.mediaimport", False)
+        self.export_media = git_config_bool(f"remote.{remotename}.mediaexport", True)
+
+        self.wiki_login = git_config(f"remote.{remotename}.mwLogin")
+        # Note: mwPassword is discouraged.  Use the credential system instead.
+        self.wiki_passwd = git_config(f"remote.{remotename}.mwPassword")
+        self.wiki_domain = git_config(f"remote.{remotename}.mwDomain")
+
+        # Import only last revisions (both for clone and fetch).
+        self.shallow_import = git_config_bool(f"remote.{remotename}.shallow", False)
+
+        # How to find out which revisions to fetch, see import_ref().
+        strategy = git_config(f"remote.{remotename}.fetchStrategy")
+        if not strategy:
+            strategy = git_config("mediawiki.fetchStrategy")
+        if self.tracked_pages:
+            # Asking the wiki for all of its revisions to find those of a
+            # handful of pages is both slow and, with by_rev, big enough to
+            # run out of memory on a wiki the size of Wikipedia.
+            strategy = "by_page"
+        elif not strategy:
+            # One request per few hundred revisions beats one per page, so
+            # that is the default whenever the whole (or a whole namespace of
+            # the) wiki is tracked.
+            strategy = "by_page" if self.tracked_categories else "by_allrev"
+        self.fetch_strategy = strategy
+
+        # Dumb push: don't update notes and mediawiki ref to reflect the last
+        # push, i.e. the user has to re-import the just-pushed revisions.  In
+        # exchange, everybody's history comes from the wiki alone.
+        dumb = git_config(f"remote.{remotename}.dumbPush", boolean=True)
+        if not dumb:
+            dumb = git_config("mediawiki.dumbPush", boolean=True)
+        self.dumb_push = dumb == "true"
+
+        # If URL is like http://user:password@example.com/, we clearly don't
+        # want the password in wiki_name.  While we're there, also remove user
+        # and '@' sign, to avoid author like MWUser@HTTPUser@host.com
+        wiki_name = re.sub(r"[^/]*://", "", self.url)
+        self.wiki_name = re.sub(r"^.*@", "", wiki_name)
+
+        self._mw: MediaWiki | None = None
+        # Remember the timestamp corresponding to a revision id.
+        self.basetimestamps: dict[int, str] = {}
+        # In memory cache for MediaWiki namespace ids, and the set of those
+        # already written to the config file (to avoid duplicates).
+        self._namespace_id: dict[str, int | None] | None = None
+        self._namespace_cached: set[str] = set()
+        self._revids_per_query: int | None = None
+
+    # -- connection --------------------------------------------------------
+
+    @property
+    def mw(self) -> MediaWiki:
+        """The API connection, made (and logged into) on first use."""
+        if self._mw is not None:
+            return self._mw
+        mw = MediaWiki(self.url)
+        if self.wiki_login:
+            cred = git_credential(
+                {
+                    "url": self.url,
+                    "username": self.wiki_login,
+                    "password": self.wiki_passwd,
+                }
+            )
+            try:
+                mw.login(
+                    cred.get("username", ""), cred.get("password", ""), self.wiki_domain
+                )
+            except MWError as exc:
+                warn(
+                    f'Failed to log in mediawiki user "{cred.get("username")}" '
+                    f"on {self.url}"
+                )
+                warn(f"  (error {exc.code}: {exc.info})")
+                git_credential(cred, "reject")
+                sys.exit(1)
+            git_credential(cred, "approve")
+            log(f'Logged in mediawiki user "{cred.get("username")}".')
+        self._mw = mw
+        return mw
+
+    def fatal_mw_error(self, action: str, exc: MWError) -> "NoReturn":  # noqa: F821
+        warn(f"fatal: could not {action}.")
+        warn(f"fatal: '{self.url}' does not appear to be a mediawiki")
+        warn(f"fatal: make sure '{self.url}/api.php' is a valid page.")
+        if self.url.startswith("https"):
+            warn("fatal: and that the SSL certificate is correct.")
+        warn(f"fatal: (error {exc.code}: {exc.info})")
+        sys.exit(1)
+
+    # -- command loop ------------------------------------------------------
+
+    def run(self) -> None:
+        while True:
+            line = read_line()
+            if line is None:
+                break
+            if not self.parse_command(line):
+                break
+            # Flush to make sure the previous command is fully processed.
+            out_flush()
+
+    def parse_command(self, line: str) -> bool:
+        cmd = line.split(" ")
+        if not cmd[0]:
+            return False
+        name = cmd[0]
+        if name == "capabilities":
+            if len(cmd) > 1:
+                die("Too many arguments for capabilities")
+            self.cmd_capabilities()
+        elif name == "list":
+            if len(cmd) > 2:
+                die("Too many arguments for list")
+            self.cmd_list()
+        elif name == "import":
+            if len(cmd) < 2 or not cmd[1]:
+                die("Invalid argument for import")
+            if len(cmd) > 2:
+                die("Too many arguments for import")
+            self.cmd_import(cmd[1])
+        elif name == "option":
+            if len(cmd) < 3 or not cmd[1] or not cmd[2]:
+                die("Invalid arguments for option")
+            if len(cmd) > 3:
+                die("Too many arguments for option")
+            self.cmd_option(cmd[1], cmd[2])
+        elif name == "push":
+            self.cmd_push(cmd[1] if len(cmd) > 1 else "")
+        else:
+            warn("Unknown command. Aborting...")
+            return False
+        return True
+
+    def cmd_capabilities(self) -> None:
+        # Revisions are imported to the private namespace
+        # refs/mediawiki/$remotename/ by the helper and fetched into
+        # refs/remotes/$remotename later by fetch.
+        out(f"refspec refs/heads/*:refs/mediawiki/{self.refname}/*\n")
+        out("import\n")
+        out("list\n")
+        out("push\n")
+        out("option\n")
+        if self.dumb_push:
+            out("no-private-update\n")
+        out("\n")
+
+    def cmd_list(self) -> None:
+        # MediaWiki has no branches, we consider one branch arbitrarily called
+        # master, and HEAD pointing to it.
+        out("? refs/heads/master\n")
+        out("@refs/heads/master HEAD\n")
+        out("\n")
+
+    def cmd_option(self, name: str, value: str) -> None:
+        global VERBOSITY
+        if name == "verbosity":
+            try:
+                VERBOSITY = int(value)
+            except ValueError:
+                out("error expected an integer\n")
+                return
+            out("ok\n")
+            return
+        # Nothing else is implemented: git tolerates that, and options it
+        # really needs (e.g. dry-run) it refuses to fake by itself.
+        debug(f"remote-helper command 'option {name}' not implemented")
+        out("unsupported\n")
+
+    # -- listing pages on the remote wiki ----------------------------------
+
+    def get_mw_pages(self) -> dict[str, dict]:
+        """The pages to be fetched, according to the configuration."""
+        log("Listing pages on remote wiki...")
+        pages: dict[str, dict] = {}  # keyed on title to avoid duplicates
+        user_defined = False
+        if self.tracked_pages:
+            user_defined = True
+            # The user provided a list of page titles, but we still need to
+            # query the API to get the page ids.
+            self.get_mw_page_list(self.tracked_pages, pages)
+        if self.tracked_categories:
+            user_defined = True
+            self.get_mw_tracked_categories(pages)
+        if self.tracked_namespaces:
+            user_defined = True
+            self.get_mw_tracked_namespaces(pages)
+        if not user_defined:
+            self.get_mw_all_pages(pages)
+        if self.import_media:
+            log("Getting media files for selected pages...")
+            if user_defined:
+                self.get_linked_mediafiles(pages)
+            else:
+                self.get_all_mediafiles(pages)
+        log(f"{len(pages)} pages found.")
+        return pages
+
+    def get_mw_page_list(self, titles: list[str], pages: dict[str, dict]) -> None:
+        """Query the wiki for a list of page titles, in slices."""
+        for start in range(0, len(titles), SLICE_SIZE):
+            slice_ = titles[start : start + SLICE_SIZE]
+            try:
+                # pattern 'page1|page2|...' required by the API
+                result = self.mw.api(
+                    {"action": "query", "titles": "|".join(slice_)}
+                )
+            except MWError as exc:
+                self.fatal_mw_error("query the list of wiki pages", exc)
+            for page in page_list(result):
+                if "missing" in page or "invalid" in page:
+                    warn(f"Warning: page {page.get('title')} not found on wiki")
+                else:
+                    pages[page["title"]] = page
+
+    def get_mw_tracked_categories(self, pages: dict[str, dict]) -> None:
+        for category in self.tracked_categories:
+            if ":" not in category:
+                # MediaWiki requires the Category prefix, but let's not force
+                # the user to specify it.
+                category = f"Category:{category}"
+            try:
+                members = self.mw.query_list(
+                    {
+                        "list": "categorymembers",
+                        "cmtitle": category,
+                        "cmlimit": "max",
+                    },
+                    "categorymembers",
+                )
+                for page in members:
+                    pages[page["title"]] = page
+            except MWError as exc:
+                die(f"{exc.code}: {exc.info}")
+
+    def get_mw_tracked_namespaces(self, pages: dict[str, dict]) -> None:
+        for local_namespace in sorted(self.tracked_namespaces):
+            if local_namespace in ("(Main)", "Main"):
+                namespace_id: int | None = 0
+            else:
+                namespace_id = self.get_mw_namespace_id(local_namespace)
+            # virtual namespaces don't support allpages
+            if namespace_id is None or namespace_id < 0:
+                continue
+            found = 0
+            try:
+                for page in self.mw.query_list(
+                    {
+                        "list": "allpages",
+                        "apnamespace": namespace_id,
+                        "aplimit": "max",
+                    },
+                    "allpages",
+                ):
+                    pages[page["title"]] = page
+                    found += 1
+            except MWError as exc:
+                die(f"{exc.code}: {exc.info}")
+            log(f"{found} found in namespace {local_namespace} ({namespace_id})")
+
+    def get_mw_all_pages(self, pages: dict[str, dict]) -> None:
+        """No user-provided list, get the list of pages from the API."""
+        try:
+            for page in self.mw.query_list(
+                {"list": "allpages", "aplimit": "max"}, "allpages"
+            ):
+                pages[page["title"]] = page
+        except MWError as exc:
+            self.fatal_mw_error("get the list of wiki pages", exc)
+
+    def get_all_mediafiles(self, pages: dict[str, dict]) -> None:
+        """Add every page of the File namespace, queried separately."""
+        try:
+            for page in self.mw.query_list(
+                {
+                    "list": "allpages",
+                    "apnamespace": self.get_mw_namespace_id("File"),
+                    "aplimit": "max",
+                },
+                "allpages",
+            ):
+                pages[page["title"]] = page
+        except MWError as exc:
+            self.fatal_mw_error("get the list of pages for media files", exc)
+
+    def get_linked_mediafiles(self, pages: dict[str, dict]) -> None:
+        """Add the media files included in or linked from the given pages."""
+        titles = [page["title"] for page in pages.values()]
+        file_ns = self.get_mw_namespace_id("File")
+        for start in range(0, len(titles), BATCH_SIZE):
+            slice_ = titles[start : start + BATCH_SIZE]
+            result = self.mw.api(
+                {
+                    "action": "query",
+                    "prop": "links|images",
+                    "titles": "|".join(slice_),
+                    "plnamespace": file_ns,
+                    "pllimit": "max",
+                }
+            )
+            media_titles = []
+            for page in page_list(result):
+                for link in (page.get("links") or []) + (page.get("images") or []):
+                    media_titles.append(link["title"])
+            if media_titles:
+                self.get_mw_page_list(media_titles, pages)
+
+    def get_mw_mediafile_for_page_revision(
+        self, filename: str, timestamp: str | None
+    ) -> dict | None:
+        """The media file of File:<filename> as of <timestamp>, if any."""
+        if not timestamp:
+            return None
+        result = self.mw.api(
+            {
+                "action": "query",
+                "prop": "imageinfo",
+                "titles": f"File:{filename}",
+                "iistart": timestamp,
+                "iiend": timestamp,
+                "iiprop": "timestamp|archivename|url",
+                "iilimit": 1,
+            }
+        )
+        for page in page_list(result):
+            infos = page.get("imageinfo") or []
+            if not infos:
+                continue
+            info = infos[-1]
+            log(f"\tDownloading file {filename}, version {info.get('timestamp')}")
+            content = self.download_mw_mediafile(info["url"])
+            if content is None:
+                warn(f"\tFAILED downloading {info['url']}! Skipping!")
+                return None
+            return {
+                "content": content,
+                "title": filename,
+                "timestamp": info.get("timestamp"),
+            }
+        return None
+
+    def download_mw_mediafile(self, download_url: str, retry: bool = True) -> bytes | None:
+        content = self.mw.download(download_url)
+        if content is not None:
+            return content
+        if retry and not download_url.startswith(self.url) and self.wiki_name in download_url:
+            # We may have failed because the URL returned from the API is
+            # missing something (e.g. "user:password@").  Retry with a
+            # corresponding URL constructed from our original url.
+            fixed = re.sub(
+                r".*?" + re.escape(self.wiki_name) + r"/", self.url + "/", download_url
+            )
+            return self.download_mw_mediafile(fixed, retry=False)
+        warn("Error downloading mediafile from:")
+        warn(f"URL: {download_url}")
+        return None
+
+    # -- revisions ---------------------------------------------------------
+
+    def get_last_local_revision(self) -> int:
+        """The MediaWiki revision id recorded in our note, or 0."""
+        note = git(
+            [
+                "notes",
+                f"--ref={self.refname}/mediawiki",
+                "show",
+                f"refs/mediawiki/{self.refname}/master",
+            ],
+            quiet_stderr=True,
+        )
+        fields = note.split()
+        # Notes are formatted: "mediawiki_revision: #number"
+        if len(fields) < 2 or fields[0] != "mediawiki_revision:":
+            log("No previous mediawiki revision found.")
+            return 0
+        try:
+            revision = int(fields[1])
+        except ValueError:
+            log(f"Ignoring malformed mediawiki revision note: {note.strip()!r}")
+            return 0
+        log(f"Last local mediawiki revision found is {revision}.")
+        return revision
+
+    def get_last_global_remote_rev(self) -> int:
+        """The last revision id of the whole wiki, with a single request.
+
+        Useful for the fetch-by-rev strategy, as it avoids looping over all
+        tracked pages.
+        """
+        result = self.mw.api(
+            {
+                "action": "query",
+                "list": "recentchanges",
+                "rclimit": 1,
+                "rcdir": "older",
+                "rcprop": "ids",
+            }
+        )
+        changes = (result.get("query") or {}).get("recentchanges") or []
+        return int(changes[0]["revid"]) if changes else 0
+
+    def get_last_remote_revision(self) -> int:
+        """The last revision id concerning the tracked pages."""
+        pages = list(self.get_mw_pages().values())
+        max_rev_num = 0
+
+        log("Getting last revision id on tracked pages...")
+        page_ids = [page["pageid"] for page in pages if page.get("pageid")]
+        for start in range(0, len(page_ids), SLICE_SIZE):
+            slice_ = page_ids[start : start + SLICE_SIZE]
+            # Without rvlimit, one (the latest) revision per page is returned.
+            result = self.mw.api(
+                {
+                    "action": "query",
+                    "prop": "revisions",
+                    "rvprop": "ids|timestamp",
+                    "pageids": "|".join(str(i) for i in slice_),
+                }
+            )
+            for page in page_list(result):
+                for rev in page.get("revisions") or []:
+                    revid = int(rev["revid"])
+                    self.basetimestamps[revid] = rev.get("timestamp")
+                    max_rev_num = max(max_rev_num, revid)
+
+        log(f"Last remote revision found is {max_rev_num}.")
+        return max_rev_num
+
+    def revids_per_query(self) -> int:
+        """How many revisions may be asked for at once.
+
+        An account with the apihighlimits right may ask for ten times as many,
+        which is worth one extra request to find out about.
+        """
+        if self._revids_per_query is None:
+            self._revids_per_query = MAX_REVIDS
+            if self.wiki_login:  # anonymous users never have the right
+                try:
+                    result = self.mw.api(
+                        {"action": "query", "meta": "userinfo", "uiprop": "rights"}
+                    )
+                except MWError:
+                    return self._revids_per_query
+                info = (result.get("query") or {}).get("userinfo") or {}
+                if "apihighlimits" in (info.get("rights") or []):
+                    log("Using the API high limits of this account.")
+                    self._revids_per_query = MAX_REVIDS_HIGH
+        return self._revids_per_query
+
+    def revision_timestamp(self, revid: int) -> str | None:
+        """The timestamp of one revision id, or None if it is gone."""
+        result = self.mw.api(
+            {
+                "action": "query",
+                "prop": "revisions",
+                "revids": revid,
+                "rvprop": "timestamp",
+            }
+        )
+        for page in page_list(result):
+            for rev in page.get("revisions") or []:
+                return rev.get("timestamp")
+        return None
+
+    def tracked_namespace_ids(self) -> list[int]:
+        """Namespaces a wiki-wide revision listing can be restricted to."""
+        if self.tracked_namespaces:
+            ids = []
+            for name in sorted(self.tracked_namespaces):
+                ns_id = (
+                    0
+                    if name in ("(Main)", "Main")
+                    else self.get_mw_namespace_id(name)
+                )
+                if ns_id is not None and ns_id >= 0:
+                    ids.append(ns_id)
+            return ids
+        # get_mw_all_pages() lists the main namespace, plus File when media
+        # files are imported.
+        ids = [0]
+        if self.import_media:
+            file_ns = self.get_mw_namespace_id("File")
+            if file_ns is not None:
+                ids.append(file_ns)
+        return ids
+
+    def fetch_mw_revisions_all(self, fetch_from: int) -> list[int] | None:
+        """Every revision id from fetch_from on, wiki-wide.
+
+        This is list=allrevisions: a few hundred revisions per request instead
+        of one request per page.  Returns None if the wiki is too old to know
+        the module (MediaWiki < 1.27), so the caller can fall back.
+        """
+        query = {
+            "list": "allrevisions",
+            "arvprop": "ids",
+            "arvdir": "newer",
+            "arvlimit": "max",
+        }
+        namespaces = self.tracked_namespace_ids()
+        if namespaces:
+            query["arvnamespace"] = "|".join(str(ns) for ns in namespaces)
+        if fetch_from > 1:
+            # allrevisions is ordered by date, so the resume point has to be
+            # expressed as one.  Revisions before it are filtered out below,
+            # exactly as by_page does with rvstartid.
+            timestamp = self.revision_timestamp(fetch_from - 1)
+            if timestamp:
+                query["arvstart"] = timestamp
+            else:
+                log(
+                    f"Revision {fetch_from - 1} is gone from the wiki, "
+                    f"listing all revisions."
+                )
+
+        revids: list[int] = []
+        newest: dict[str, int] = {}  # title -> newest revid, for shallow
+        report = 1000
+        try:
+            for page in self.mw.query_list(query, "allrevisions"):
+                title = page.get("title", "")
+                for rev in page.get("revisions") or []:
+                    revid = int(rev["revid"])
+                    if revid < fetch_from:
+                        continue
+                    if self.shallow_import:
+                        newest[title] = max(newest.get(title, 0), revid)
+                    else:
+                        revids.append(revid)
+                if len(revids) >= report:
+                    log(f"  {len(revids)} revisions listed...")
+                    report += 1000
+        except MWError as exc:
+            if exc.code in ("unknown_list", "badvalue", "unrecognizedvalue"):
+                log(f"This wiki has no list=allrevisions ({exc.code}: {exc.info}).")
+                return None
+            raise
+
+        if self.shallow_import:
+            revids = sorted(newest.values())
+            log(f"Found {len(revids)} revision(s) (shallow import).")
+        else:
+            revids.sort()
+            log(f"Found {len(revids)} revision(s) on the wiki.")
+        return revids
+
+    def fetch_mw_revisions_for_page(self, page: dict, fetch_from: int) -> list[int]:
+        query = {
+            "action": "query",
+            "prop": "revisions",
+            "rvprop": "ids",
+            "rvdir": "newer",
+            "rvlimit": "max",
+            "pageids": page["pageid"],
+            # Let MediaWiki know that we support the latest API.
+            "continue": "",
+        }
+        # Don't add the start if it is 1 since not all pages start at 1.
+        if fetch_from != 1:
+            query["rvstartid"] = fetch_from
+
+        revids: list[int] = []
+        while True:
+            result = self.mw.api(query)
+            for result_page in page_list(result):
+                for rev in result_page.get("revisions") or []:
+                    revids.append(int(rev["revid"]))
+            cont = continuation(result)
+            if not cont:
+                break
+            query.update(cont)
+
+        if self.shallow_import and revids:
+            log("  Found 1 revision (shallow import).")
+            return [max(revids)]
+        log(f"  Found {len(revids)} revision(s).")
+        return revids
+
+    def fetch_mw_revisions(self, pages: list[dict], fetch_from: int) -> list[int]:
+        revids: list[int] = []
+        for n, page in enumerate(pages, start=1):
+            log(f"page {n}/{len(pages)}: {page['title']}")
+            revids.extend(self.fetch_mw_revisions_for_page(page, fetch_from))
+        return revids
+
+    # -- import ------------------------------------------------------------
+
+    def cmd_import(self, ref: str) -> None:
+        # Multiple import commands can follow each other.
+        refs = [ref] + get_more_refs("import")
+        done = set()
+        for ref in refs:
+            if ref in done:  # skip duplicates
+                continue
+            done.add(ref)
+            self.import_ref(ref)
+        out("done\n")
+
+    def import_ref(self, ref: str) -> None:
+        # The remote helper will call "import HEAD" and "import
+        # refs/heads/master".  Since HEAD is a symbolic ref to master (by
+        # convention, followed by the output of the command "list" that we
+        # gave), we don't need to do anything in this case.
+        if ref == "HEAD":
+            return
+
+        log("Searching revisions...")
+        fetch_from = self.get_last_local_revision() + 1
+        if fetch_from == 1:
+            log("Fetching from beginning.")
+        else:
+            log("Fetching from here.")
+
+        count: int | None = None
+        if self.fetch_strategy == "by_allrev":
+            log("Fetching & writing export data by all revisions...")
+            count = self.import_ref_by_allrev(fetch_from)
+            if count is None:
+                log("Falling back to fetching by pages.")
+                count = self.import_ref_by_pages(fetch_from)
+        elif self.fetch_strategy == "by_rev":
+            log("Fetching & writing export data by revs...")
+            count = self.import_ref_by_revs(fetch_from)
+        elif self.fetch_strategy == "by_page":
+            log("Fetching & writing export data by pages...")
+            count = self.import_ref_by_pages(fetch_from)
+        else:
+            warn(f'fatal: invalid fetch strategy "{self.fetch_strategy}".')
+            die(
+                f"Check your configuration variables "
+                f"remote.{self.remotename}.fetchStrategy and "
+                f"mediawiki.fetchStrategy"
+            )
+
+        if fetch_from == 1 and count == 0:
+            warn("You appear to have cloned an empty MediaWiki.")
+            # Something has to be done remote-helper side.  If nothing is
+            # done, an error is thrown saying that HEAD is referring to
+            # unknown object 000000000... and the clone fails.
+
+    def import_ref_by_allrev(self, fetch_from: int) -> int | None:
+        """Import using one wiki-wide revision listing.
+
+        Returns None if the wiki cannot list revisions that way.
+        """
+        revids = self.fetch_mw_revisions_all(fetch_from)
+        if revids is None:
+            return None
+        if not revids:
+            # Nothing new: an up-to-date fetch costs a couple of requests, no
+            # matter how many pages the wiki has.
+            log("No new revision on the remote wiki.")
+            return 0
+        return self.import_revids(fetch_from, revids, self.get_mw_pages())
+
+    def import_ref_by_pages(self, fetch_from: int) -> int:
+        pages = self.get_mw_pages()
+        revids = sorted(set(self.fetch_mw_revisions(list(pages.values()), fetch_from)))
+        return self.import_revids(fetch_from, revids, pages)
+
+    def import_ref_by_revs(self, fetch_from: int) -> int:
+        pages = self.get_mw_pages()
+        last_remote = self.get_last_global_remote_rev()
+        revids = list(range(fetch_from, last_remote + 1))
+        return self.import_revids(fetch_from, revids, pages)
+
+    def import_revids(
+        self, fetch_from: int, revids: list[int], pages: dict[str, dict]
+    ) -> int:
+        """Import the given revisions, of the given pages only."""
+        total = len(revids)
+        n_actual = 0
+        # Remember the timestamp of the previous revision of a page, as a
+        # stand-in for revisions whose timestamp the wiki hides.
+        last_timestamps: dict[str, datetime] = {}
+
+        batch_size = self.revids_per_query()
+        start = 0
+        while start < total:
+            chunk = revids[start : start + batch_size]
+            try:
+                result = self.mw.api(
+                    {
+                        "action": "query",
+                        "prop": "revisions",
+                        "rvprop": "content|timestamp|comment|user|ids",
+                        "rvslots": "main",
+                        "revids": "|".join(str(revid) for revid in chunk),
+                    }
+                )
+            except MWError as exc:
+                if exc.code == "toomanyvalues" and batch_size > MAX_REVIDS:
+                    # The account does not really get the high limits after all.
+                    log(f"Asking for {MAX_REVIDS} revisions at a time instead.")
+                    batch_size = self._revids_per_query = MAX_REVIDS
+                    continue
+                die(
+                    f"Failed to retrieve modified page for revision(s) "
+                    f"{','.join(str(r) for r in chunk)}: {exc}"
+                )
+            chunk_start, start = start, start + len(chunk)
+
+            # A batch may span several pages; keep the wiki's chronology.
+            batch = [
+                (int(rev["revid"]), page, rev)
+                for page in page_list(result)
+                for rev in page.get("revisions") or []
+            ]
+            batch.sort(key=lambda item: item[0])
+
+            for offset, (revid, page, rev) in enumerate(batch):
+                # Count revisions even if we skip them, since we display
+                # n/total and total includes skipped revisions.
+                n = min(chunk_start + offset + 1, total)
+                title = page["title"]
+                if title not in pages:
+                    log(f"{n}/{total}: Skipping revision #{revid} of {title}")
+                    continue
+                n_actual += 1
+
+                content = revision_content(rev)
+                commit = {
+                    "author": rev.get("user") or "Anonymous",
+                    "comment": rev.get("comment") or EMPTY_MESSAGE,
+                    "title": smudge_filename(title),
+                    "mw_revision": revid,
+                    "content": (
+                        mediawiki_smudge(content)
+                        if content is not None
+                        # This may not be the best thing to do with
+                        # suppressed revisions -- it creates a huge diff
+                        # between three revisions.
+                        else SUPPRESSED_REVISION
+                    ),
+                }
+
+                timestamp = rev.get("timestamp")
+                if timestamp:
+                    date = parse_timestamp(timestamp)
+                else:
+                    date = last_timestamps.get(
+                        title, datetime.fromtimestamp(0, timezone.utc)
+                    ) + timedelta(seconds=1)
+                last_timestamps[title] = date
+                commit["date"] = date
+
+                # Differentiate classic pages and media files.
+                mediafile = None
+                namespace, _, filename = title.partition(":")
+                if filename:
+                    ns_id = self.get_mw_namespace_id(namespace)
+                    if ns_id is not None and ns_id == self.get_mw_namespace_id("File"):
+                        mediafile = self.get_mw_mediafile_for_page_revision(
+                            filename, timestamp
+                        )
+
+                log(f"{n}/{total}: Revision #{revid} of {commit['title']}")
+                self.import_file_revision(
+                    commit, fetch_from == 1, n_actual, mediafile
+                )
+
+        return n_actual
+
+    def import_file_revision(
+        self, commit: dict, full_import: bool, n: int, mediafile: dict | None
+    ) -> None:
+        title = commit["title"]
+        author = sanitize_ident(commit["author"])
+        email = f"{author.replace(' ', '_')}@{self.wiki_name}"
+        epoch = int(commit["date"].timestamp())
+
+        out(f"commit refs/mediawiki/{self.refname}/master\n")
+        out(f"mark :{n}\n")
+        out(f"committer {author} <{email}> {epoch} +0000\n")
+        literal_data(commit["comment"])
+
+        # If it's not a clone, we need to know where to start from.
+        if not full_import and n == 1:
+            out(f"from refs/mediawiki/{self.refname}/master^0\n")
+        if commit["content"] != DELETED_CONTENT:
+            out("M 644 inline " + fe_escape_path(f"{title}.mw") + "\n")
+            literal_data(commit["content"])
+            if mediafile:
+                out("M 644 inline " + fe_escape_path(mediafile["title"]) + "\n")
+                literal_data_raw(mediafile["content"])
+            out("\n\n")
+        else:
+            out("D " + fe_escape_path(f"{title}.mw") + "\n")
+
+        # MediaWiki revision number in the git note.
+        if full_import and n == 1:
+            out(f"reset refs/notes/{self.refname}/mediawiki\n")
+        out(f"commit refs/notes/{self.refname}/mediawiki\n")
+        out(f"committer {author} <{email}> {epoch} +0000\n")
+        literal_data("Note added by git-mediawiki during import")
+        if not full_import and n == 1:
+            out(f"from refs/notes/{self.refname}/mediawiki^0\n")
+        out(f"N inline :{n}\n")
+        literal_data(f"mediawiki_revision: {commit['mw_revision']}")
+        out("\n\n")
+
+    # -- push --------------------------------------------------------------
+
+    def cmd_push(self, refspec: str) -> None:
+        # Multiple push statements can follow each other.
+        refspecs = [refspec] + get_more_refs("push")
+        pushed = False
+        for spec in refspecs:
+            match = re.match(r"^(\+)?([^:]*):([^:]*)$", spec)
+            if not match:
+                die(
+                    "Invalid refspec for push. Expected <src>:<dst> or +<src>:<dst>"
+                )
+            force, local, remote = match.groups()
+            if force:
+                warn("Warning: forced push not allowed on a MediaWiki.")
+            if not local:
+                warn("Cannot delete remote branch on a MediaWiki")
+                out(f"error {remote} cannot delete\n")
+                continue
+            if remote != "refs/heads/master":
+                warn("Only push to the branch 'master' is supported on a MediaWiki")
+                out(f"error {remote} only master allowed\n")
+                continue
+            if self.push_revision(local, remote):
+                pushed = True
+
+        # Notify Git that the push is done.
+        out("\n")
+
+        if pushed and self.dumb_push:
+            warn("Just pushed some revisions to MediaWiki.")
+            warn(
+                "The pushed revisions now have to be re-imported, and your "
+                "current branch"
+            )
+            warn("needs to be updated with these re-imported commits. You can do this with")
+            warn("")
+            warn("  git pull --rebase")
+            warn("")
+
+    def error_non_fast_forward(self, remote: str) -> bool:
+        if git_config("advice.pushNonFastForward", boolean=True) != "false":
+            # Native git-push would show this after the summary.  We can't ask
+            # it to display it cleanly, so print it ourselves before.
+            warn(
+                "To prevent you from losing history, non-fast-forward updates "
+                "were rejected"
+            )
+            warn(
+                "Merge the remote changes (e.g. 'git pull') before pushing "
+                "again.  See the"
+            )
+            warn(
+                "'Note about fast-forwards' section of 'git push --help' for "
+                "details."
+            )
+        out(f'error {remote} "non-fast-forward"\n')
+        return False
+
+    def push_revision(self, local: str, remote: str) -> bool:
+        last_local_revid = self.get_last_local_revision()
+        last_remote_revid = self.get_last_remote_revision()
+        mw_revision = last_remote_revid
+
+        # sha1 of the commit pointed to by local HEAD, and by the remote ref.
+        head_sha1 = git(["rev-parse", local], quiet_stderr=True).strip()
+        remote_sha1 = git(
+            ["rev-parse", f"refs/remotes/{self.refname}/master"], quiet_stderr=True
+        ).strip()
+
+        if 0 < last_local_revid < last_remote_revid:
+            return self.error_non_fast_forward(remote)
+
+        if head_sha1 == remote_sha1:
+            return False  # nothing to push
+
+        commit_pairs = self.commit_pairs_to_push(
+            local, head_sha1, remote_sha1, last_local_revid
+        )
+        if commit_pairs is None:
+            return self.error_non_fast_forward(remote)
+
+        for parent_sha1, commit_sha1 in commit_pairs:
+            # TODO: we could detect renames, and encode them with a #redirect
+            # on the wiki.  For now, it's just a delete+add.
+            raw = git_bytes(
+                ["diff-tree", "-r", "--raw", "-z", parent_sha1, commit_sha1]
+            )
+            fields = raw.split(b"\0")
+            # Keep the subject line of the commit message as the mediawiki
+            # comment for the revision.
+            summary = git(
+                ["log", "--no-walk", "--format=%s", commit_sha1]
+            ).strip()
+
+            # git diff-tree -z gives <metadata>\0<filename>\0 records.
+            for i in range(0, len(fields) - 1, 2):
+                info = fields[i].decode("utf-8", "replace")
+                if not info:
+                    continue
+                path = fields[i + 1].decode("utf-8", "surrogateescape")
+                mw_revision, status = self.push_file(
+                    info, path, summary, mw_revision
+                )
+                if status == "non-fast-forward":
+                    # We may already have sent part of the commit to
+                    # MediaWiki, but it's too late to cancel it.  Stop the
+                    # push in the middle, but still give an accurate error.
+                    return self.error_non_fast_forward(remote)
+                if status != "ok":
+                    die("Unknown error from push_file()")
+
+            if not self.dumb_push:
+                git(
+                    [
+                        "notes",
+                        f"--ref={self.refname}/mediawiki",
+                        "add",
+                        "-f",
+                        "-m",
+                        f"mediawiki_revision: {mw_revision}",
+                        commit_sha1,
+                    ]
+                )
+
+        out(f"ok {remote}\n")
+        return True
+
+    def commit_pairs_to_push(
+        self, local: str, head_sha1: str, remote_sha1: str, last_local_revid: int
+    ) -> list[tuple[str, str]] | None:
+        """(parent, commit) pairs to export, oldest first.
+
+        None means no path from the last exported commit to HEAD was found.
+        """
+        if last_local_revid > 0 and remote_sha1:
+            # Find a path from last MediaWiki commit to pushed commit.
+            log("Computing path from local to remote ...")
+            ancestry: dict[str, str] = {}
+            for line in git(
+                ["rev-list", "--boundary", "--parents", local, f"^{remote_sha1}"]
+            ).splitlines():
+                match = re.match(r"^-?([0-9a-f]+) ([0-9a-f ]+)", line)
+                if match:
+                    child, parents = match.group(1), match.group(2)
+                    for parent in parents.split():
+                        ancestry[parent] = child
+                elif not re.match(r"^-?[0-9a-f]+$", line):
+                    die(f"Unexpected output from git rev-list: {line}")
+
+            pairs = []
+            sha1 = remote_sha1
+            while sha1 != head_sha1:
+                child = ancestry.get(sha1)
+                if not child:
+                    warn(
+                        "Cannot find a path in history from remote commit to "
+                        "last commit"
+                    )
+                    return None
+                pairs.append((sha1, child))
+                sha1 = child
+            return pairs
+
+        # No remote mediawiki revision: export the whole history, linearized
+        # with --first-parent.
+        warn("Warning: no common ancestor, pushing complete history")
+        chain = git(["rev-list", "--first-parent", "--reverse", local]).split()
+        return [
+            (empty_tree() if i == 0 else chain[i - 1], sha1)
+            for i, sha1 in enumerate(chain)
+        ]
+
+    def push_file(
+        self, diff_info: str, path: str, summary: str, oldrevid: int
+    ) -> tuple[int, str]:
+        """Export one file of one commit to the wiki.
+
+        diff_info holds ":100644 100644 <old sha1> <new sha1> <status>", path
+        is the file name including its extension, and oldrevid the MediaWiki
+        revision to keep in case there is no edit to perform.
+        """
+        info = re.split(r"[ \t]", diff_info)
+        old_sha1, new_sha1 = info[2], info[3]
+        page_created = old_sha1 == NULL_SHA1
+        page_deleted = new_sha1 == NULL_SHA1
+
+        if summary == EMPTY_MESSAGE:
+            summary = ""
+
+        complete_file_name = clean_filename(path)
+        title, _, extension = complete_file_name.rpartition(".")
+        if not title:  # no dot in the name at all
+            title, extension = complete_file_name, ""
+
+        newrevid = None
+        if extension == "mw":
+            ns_id = self.get_mw_namespace_id_for_page(complete_file_name)
+            if (
+                ns_id is not None
+                and not self.export_media
+                and ns_id == self.get_mw_namespace_id("File")
+            ):
+                log(f"Ignoring media file related page: {complete_file_name}")
+                return oldrevid, "ok"
+            if page_deleted:
+                # Deleting a page usually requires special privileges.  A
+                # common convention is to replace the page with this content.
+                file_content = DELETED_CONTENT
+            else:
+                file_content = git_bytes(["cat-file", "blob", new_sha1]).decode(
+                    "utf-8", "replace"
+                )
+
+            try:
+                result = self.mw.write(
+                    {
+                        "action": "edit",
+                        "title": title,
+                        "summary": summary,
+                        "basetimestamp": self.basetimestamps.get(oldrevid),
+                        "text": mediawiki_clean(file_content, page_created),
+                    }
+                )
+            except MWError as exc:
+                if exc.code in ("editconflict", "articleexists", "pagedeleted"):
+                    warn(f"Warning: Error {exc.code} from mediawiki: {exc.info}.")
+                    return oldrevid, "non-fast-forward"
+                die(f"Fatal: Error {exc.code} from mediawiki: {exc.info}")
+            edit = result.get("edit") or {}
+            newrevid = edit.get("newrevid")
+            log(f"Pushed file: {new_sha1} - {title}")
+        elif self.export_media:
+            newrevid = self.upload_file(
+                complete_file_name, new_sha1, extension, page_deleted, summary
+            )
+        else:
+            log(f"Ignoring media file {title}")
+
+        return (int(newrevid) if newrevid else oldrevid), "ok"
+
+    def upload_file(
+        self,
+        complete_file_name: str,
+        new_sha1: str,
+        extension: str,
+        file_deleted: bool,
+        summary: str,
+    ) -> int | None:
+        path = f"File:{complete_file_name}"
+        if extension not in self.get_allowed_file_extensions():
+            warn(f"{complete_file_name} is not a permitted file on this wiki.")
+            warn("Check the configuration of file uploads in your mediawiki.")
+            return None
+
+        # Deleting and uploading a file requires a privileged user.
+        if file_deleted:
+            try:
+                self.mw.write(
+                    {"action": "delete", "title": path, "reason": summary}
+                )
+            except MWError as exc:
+                warn("Failed to delete file on remote wiki")
+                warn("Check your permissions on the remote site. Error code:")
+                die(f"{exc.code}: {exc.info}")
+            return None
+
+        content = git_bytes(["cat-file", "blob", new_sha1])
+        if not content:
+            log(f"Empty file {complete_file_name} not pushed.")
+            return None
+
+        try:
+            self.mw.upload(complete_file_name, content, summary)
+        except MWError as exc:
+            die(f"{exc.code}: {exc.info}")
+        result = self.mw.api(
+            {"action": "query", "prop": "info", "titles": path}
+        )
+        newrevid = None
+        for page in page_list(result):
+            newrevid = page.get("lastrevid")
+        log(f"Pushed file: {new_sha1} - {complete_file_name}.")
+        return newrevid
+
+    def get_allowed_file_extensions(self) -> set[str]:
+        result = self.mw.api(
+            {
+                "action": "query",
+                "meta": "siteinfo",
+                "siprop": "fileextensions",
+            }
+        )
+        extensions = (result.get("query") or {}).get("fileextensions") or []
+        return {ext["ext"] for ext in extensions if "ext" in ext}
+
+    # -- namespaces --------------------------------------------------------
+
+    def get_mw_namespace_id(self, name: str) -> int | None:
+        """MediaWiki id of a namespace name, e.g. "File", "Project"."""
+        if self._namespace_id is None:
+            self._namespace_id = {}
+            # Namespaces cached in the configuration file are stored as
+            # "Name_of_namespace:Id_namespace", e.g. "File:6".
+            for entry in git(
+                ["config", "--get-all", f"remote.{self.remotename}.namespaceCache"],
+                quiet_stderr=True,
+            ).splitlines():
+                entry = entry.strip()
+                if not entry:
+                    continue
+                ns_name, _, ns_id = entry.partition(":")
+                self._namespace_id[ns_name] = (
+                    None if ns_id == "notANameSpace" else int(ns_id)
+                )
+                self._namespace_cached.add(ns_name)
+
+        if name not in self._namespace_id:
+            log(f"Namespace {name} not found in cache, querying the wiki ...")
+            self.load_namespaces()
+
+        if name not in self._namespace_id:
+            known = ", ".join(sorted(n.replace(" ", "_") for n in self._namespace_id))
+            warn(f"No such namespace {name} on MediaWiki, known namespaces: {known}")
+            self._namespace_id[name] = None
+
+        ns_id = self._namespace_id[name]
+
+        # Store explicitly requested namespaces on disk.
+        if name not in self._namespace_cached:
+            stored = "notANameSpace" if ns_id is None else str(ns_id)
+            git(
+                [
+                    "config",
+                    "--add",
+                    f"remote.{self.remotename}.namespaceCache",
+                    f"{name}:{stored}",
+                ]
+            )
+            self._namespace_cached.add(name)
+        return ns_id
+
+    def load_namespaces(self) -> None:
+        assert self._namespace_id is not None
+        try:
+            result = self.mw.api(
+                {
+                    "action": "query",
+                    "meta": "siteinfo",
+                    "siprop": "namespaces|namespacealiases",
+                }
+            )
+        except MWError as exc:
+            self.fatal_mw_error("get the list of wiki namespaces", exc)
+        query = result.get("query") or {}
+        namespaces = query.get("namespaces") or {}
+        if isinstance(namespaces, dict):
+            namespaces = list(namespaces.values())
+        for namespace in namespaces:
+            if "id" not in namespace:
+                continue
+            ns_id = int(namespace["id"])
+            for key in ("canonical", "name", "*"):
+                # "name" (or "*" in formatversion=1) is the localised name,
+                # e.g. french "Fichier" for canonical "File".
+                value = namespace.get(key)
+                if value:
+                    self._namespace_id[value] = ns_id
+        for alias in query.get("namespacealiases") or []:
+            value = alias.get("alias", alias.get("*"))
+            if value:
+                self._namespace_id[value] = int(alias["id"])
+
+    def get_mw_namespace_id_for_page(self, page: str) -> int | None:
+        namespace, sep, _ = page.partition(":")
+        if not sep:
+            return None
+        return self.get_mw_namespace_id(namespace)
+
+
+# --------------------------------------------------------------------------
+# plumbing for the remote helper protocol
+# --------------------------------------------------------------------------
+
+
+def read_line() -> str | None:
+    line = sys.stdin.buffer.readline()
+    if not line:
+        return None
+    return line.decode("utf-8", "surrogateescape").rstrip("\n")
+
+
+def get_more_refs(cmd: str) -> list[str]:
+    """Read a batch of "<cmd> <arg>" lines, terminated by an empty line."""
+    refs = []
+    while True:
+        line = read_line()
+        if line is None or line == "":
+            return refs
+        if line.startswith(f"{cmd} "):
+            refs.append(line[len(cmd) + 1 :])
+        else:
+            die(f"Invalid command in a '{cmd}' batch: {line}")
+
+
+def parse_timestamp(timestamp: str) -> datetime:
+    """Parse a MediaWiki ISO 8601 timestamp into an aware datetime."""
+    try:
+        date = datetime.fromisoformat(timestamp)
+    except ValueError:
+        date = datetime.strptime(timestamp, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc
+        )
+    if date.tzinfo is None:
+        date = date.replace(tzinfo=timezone.utc)
+    return date
+
+
+def ref_safe_name(name: str) -> str:
+    """Turn a remote name into something usable inside a ref name."""
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", name)
+    safe = re.sub(r"\.{2,}", ".", safe).strip("-.")
+    return safe or "remote"
+
+
+def normalize_url(url: str) -> str:
+    """Turn the URL Git gives us into one we can talk HTTP to.
+
+    Git hands over the address part of "mw::<address>" verbatim, but with a
+    "mw://host/path" style remote it hands over the whole thing.
+    """
+    for scheme in ("mw", "mediawiki"):
+        for sep, target in ((f"{scheme}://", "https://"), (f"{scheme}+http://", "http://"),
+                            (f"{scheme}+https://", "https://")):
+            if url.startswith(sep):
+                return target + url[len(sep) :]
+    return url
+
+
+def exit_error_usage() -> "NoReturn":  # noqa: F821
+    die(
+        "ERROR: git-remote-mw was not called with a correct number of parameters\n"
+        "You may obtain this error because you attempted to run the\n"
+        "git-remote-mw helper directly.\n"
+        "This helper can be used the following way:\n"
+        "\tgit clone mw::<address of a mediawiki>\n"
+        "Then, use git commit, push and pull as with every normal git "
+        "repository."
+    )
 
 
 def main() -> None:
-    print("Hello from git-remote-mw!")
+    argv = sys.argv[1:]
+    if len(argv) != 2:
+        exit_error_usage()
+    helper = Helper(argv[0], argv[1])
+    try:
+        helper.run()
+    except BrokenPipeError:  # git went away, nothing to report
+        try:
+            OUT.close()
+        except BrokenPipeError:
+            pass
+        os._exit(0)
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except MWError as exc:
+        die(f"fatal: mediawiki error {exc.code}: {exc.info}")
+    finally:
+        try:
+            out_flush()
+        except (BrokenPipeError, ValueError):
+            pass
 
 
 if __name__ == "__main__":

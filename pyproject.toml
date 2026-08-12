@@ -1,7 +1,7 @@
 [project]
 name = "git-remote-mw"
 version = "0.1.0"
-description = "Add your description here"
+description = "A git remote helper to use a MediaWiki as a git remote"
 readme = {file = "README.org", content-type = "text/org"}
 authors = [
     { name = "Brett Viren", email = "brett.viren@gmail.com" }
@@ -9,9 +9,12 @@ authors = [
 requires-python = ">=3.12"
 dependencies = []
 
-[project.scripts]
-git-remote-mw = "git_remote_mw:main"
-
 [build-system]
 requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
+
+# git-remote-mw is a single stand-alone script (git needs to find it on PATH
+# under exactly that name, see README.org), not an importable module, so there
+# is no console_scripts entry point to declare.
+[tool.setuptools]
+py-modules = []

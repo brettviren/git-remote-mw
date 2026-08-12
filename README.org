@@ -1,0 +1,259 @@
+#+title: git-remote-mw
+#+options: toc:2
+
+* Overview
+
+=git-remote-mw= is a Git [[https://git-scm.com/docs/gitremote-helpers][remote helper]] that makes a MediaWiki
+look like a Git remote:
+
+#+begin_src shell
+  git clone mw::https://example.com/wiki
+  $EDITOR Main_Page.mw
+  git commit -a -m 'edit from git'
+  git push
+  git pull --rebase
+#+end_src
+
+See [[Authentication]] below if your wiki requires a login.
+
+Each wiki page becomes a file =<Page_title>.mw= and each MediaWiki revision
+becomes one Git commit.  It is a single, stand-alone Python script that talks
+to the [[https://www.mediawiki.org/wiki/API:Main_page][MediaWiki Action API]] using nothing but the Python standard library:
+no =requests=, no wiki client library.
+
+It is a re-implementation of the Perl [[https://github.com/Git-Mediawiki/Git-Mediawiki][git-remote-mediawiki]], and is meant to
+be a drop-in replacement for it: the same config variables, the same file
+naming, the same private refs and notes.  A repository cloned with one can be
+fetched from and pushed to with the other.
+
+It also fetches a great deal faster than git-remote-mediawiki does, by listing
+revisions wiki-wide instead of page by page, by reusing the connection to the
+wiki, and by using compression in flight.  See [[Speed]].
+
+* Requirements
+
+- Python 3.12 or newer.
+- Git 2.x.
+
+* Installation
+
+Git finds a helper by looking for =git-remote-<transport>= on =PATH=, so
+installing means putting this one script somewhere on it under exactly that
+name:
+
+#+begin_src shell
+  ln -s "$PWD/git-remote-mw" ~/.local/bin/git-remote-mw
+#+end_src
+
+If you do not want the =uv= shebang, drop it and use =#!/usr/bin/env python3=,
+or install into git's exec path (=git --exec-path=) instead.
+
+* URL syntax
+
+| =mw::https://example.com/wiki= | recommended; anything after =mw::= is used verbatim |
+| =mw://example.com/wiki=        | assumed to be =https://=                            |
+
+The wiki's API endpoint is derived by appending =/api.php=.  If your wiki
+puts =api.php= elsewhere, name it in the URL directly, e.g.
+=mw::https://example.com/w/api.php=.
+
+* Configuration
+
+All of these are optional and read from Git's config, so they can be set at
+clone time with =git clone -c <key>=<value> ...= or later with =git config=.
+
+| Variable                       | Meaning                                                       |
+|--------------------------------+---------------------------------------------------------------|
+| =remote.<name>.pages=          | space separated page titles to track (default: all pages)     |
+| =remote.<name>.categories=     | space separated categories whose members to track             |
+| =remote.<name>.namespaces=     | space separated namespaces to track, e.g. ='(Main) Talk'=      |
+| =remote.<name>.shallow=        | import only the newest revision of each page                  |
+| =remote.<name>.fetchStrategy=  | ~by_allrev~ (default), ~by_page~ or ~by_rev~, see below         |
+| =remote.<name>.mediaimport=    | also import uploaded files (default =false=)                   |
+| =remote.<name>.mediaexport=    | also upload files on push (default =true=)                     |
+| =remote.<name>.mwLogin=        | wiki user name; the password comes from git's credential API  |
+| =remote.<name>.mwPassword=     | wiki password (discouraged, prefer the credential helper)     |
+| =remote.<name>.mwDomain=       | login domain, for wikis with LDAP and friends                 |
+| =remote.<name>.dumbPush=       | do not update notes and refs on push                          |
+| =mediawiki.fetchStrategy=      | fallback for =remote.<name>.fetchStrategy=                     |
+| =mediawiki.dumbPush=           | fallback for =remote.<name>.dumbPush=                          |
+
+The =<name>= is the remote name, often "origin".
+Git's own HTTP configuration is used for TLS: =http.sslCAInfo=,
+=http.sslVerify=, and the =GIT_SSL_CAINFO= and =GIT_SSL_NO_VERIFY= environment
+variables, which is what a wiki with a self-signed certificate needs.
+
+** Fetch strategies
+
+This decides how the helper finds out /which/ revisions it has to fetch.
+
+- ~by_allrev~ asks the wiki for all revisions of the tracked namespaces with
+  =list=allrevisions=, up to 500 revisions per request, resuming from the
+  timestamp of the last imported revision.  This is the default, and what you
+  want for a whole wiki or whole namespaces.  It needs MediaWiki 1.27 or
+  newer; on an older wiki the helper says so and falls back to ~by_page~.
+- ~by_page~ asks every tracked page for its new revisions: one request per
+  page, however few revisions come back.  Best when tracking a handful of
+  pages out of a busy wiki, and used automatically when =pages= is set.
+- ~by_rev~ asks the wiki for its newest revision id and walks every integer id
+  from the last imported one, discarding those that do not touch tracked
+  pages.  Superseded by ~by_allrev~; it is kept because git-remote-mediawiki
+  has it.
+
+** Authentication
+
+Set =mwLogin= and let git's credential system supply the password:
+
+#+begin_src shell
+  git config remote.origin.mwLogin 'MyUser'
+  git config credential.helper store   # or cache, libsecret, ...
+#+end_src
+
+On a modern MediaWiki, a [[https://www.mediawiki.org/wiki/Manual:Bot_passwords][bot password]] (API key) may be needed.  To set this up
+visit the =Special:BotPasswords= page.  Choose a "botname" which later will be
+combined with your Username like "Username@bothname".  Also select at least the
+permissions: "basic rights", "high-volume access", "edit existing pages".
+Submit and MediaWiki will generate an API key / password.  The key ends in "+\"
+(plus and backslash).  Be sure the backslash does not get lost in any
+text processing you may use.
+
+#+begin_example
+$ export APIKEY="abcde.....+\"
+$ echo $APIKEY   # make sure not to lose the backslash.
+
+$ mkdir ~/dev/my-wiki
+$ cd ~/dev/my-wiki
+
+$ git init
+$ git remote set-url origin mw::https://example.com/w
+$ git config remote.origin.mwLogin "Username@botname"
+$ git config remote.origin.mwPassword "$APIKEY"
+$ chmod 600 .git/config  # modestly protect the API key 
+$ git pull
+#+end_example  
+
+** Push metadata and =dumbPush=
+
+By default, a push records in a Git note the MediaWiki revision each pushed
+commit became, so the next fetch does not re-import your own edits.  The
+drawback is that your history is not the one other cloners of the wiki see.
+With =dumbPush=true= the metadata is left alone and you are asked to run
+=git pull --rebase= after a push, which re-imports the pushed revisions from
+the wiki; then everybody's history matches.
+
+* How things are mapped
+
+| MediaWiki                     | Git                                             |
+|-------------------------------+-------------------------------------------------|
+| page title =Main Page=        | file =Main_Page.mw=                              |
+| page title =Deep/Page=        | file =Deep%2FPage.mw=                            |
+| characters =[ ] { } \vert=    | =_%_<hex>= in the title, decoded back into files  |
+| revision                      | commit on =refs/mediawiki/<remote>/master=       |
+| revision id                   | note on =refs/notes/<remote>/mediawiki=          |
+| uploaded file =File:logo.png= | files =logo.png= and =File:logo.png.mw=          |
+| revision author               | commit author =<user> <user@wiki.host>=          |
+| revision comment              | commit message                                  |
+
+Pages are only ever blanked, never deleted: removing a file in Git replaces
+the page content with =[[Category:Deleted]]=, since deletion needs privileges
+most users do not have.  Media files, on the other hand, are really deleted
+(and that will fail without the privilege).
+
+* Speed
+
+Fetching is entirely dominated by the number of API round trips, each of which
+costs a few hundred milliseconds against a real wiki.  So:
+
+- Revisions are listed wiki-wide, up to 500 per request
+  (=list=allrevisions=), instead of one request per page.
+- An up-to-date fetch costs two requests, no matter how many pages the wiki
+  has: when the revision listing comes back empty, the page list is never even
+  asked for.
+- Revision content is fetched 50 revisions per request, or 500 for an account
+  with the =apihighlimits= right (typically bots and admins), which the helper
+  checks for once and then uses.  This is the floor for a first clone.
+- Connections are kept alive, so one TCP and TLS handshake serves a whole
+  fetch instead of one per request.
+- Answers are gzipped, which matters once whole revisions are being shipped.
+
+Measured against the fake wiki of the test suite, filled with 781 pages and
+1368 revisions:
+
+| Operation                | ~by_page~ | ~by_allrev~ |
+|--------------------------+-----------+-------------|
+| first clone              | 811 requests | 33 requests |
+| fetch with nothing new   | 783 requests |  2 requests |
+
+At a quarter second per request that is 3.4 minutes versus 8 seconds for the
+clone, and 3.3 minutes versus half a second for a fetch that has nothing to
+do.
+
+If a first clone is still too slow for your taste,
+=remote.<name>.shallow=true= imports only the newest revision of each page,
+and =remote.<name>.namespaces= or =pages= limits what is fetched in the first
+place.  Note also that =mediaimport=true= costs one extra request per revision
+of a media file.
+
+* Differences from git-remote-mediawiki
+
+Behaviour is intentionally the same, except where the Perl version looked
+plainly broken:
+
+- Pushing a repository with no wiki metadata exports the whole history
+  *including its root commit* (the Perl version skips the root commit's
+  content).
+- The commit subject is used as the wiki edit summary without the stray
+  double quotes the Perl version adds.
+- Revisions fetched in one API batch are committed in revision-id order
+  rather than in whatever order the wiki listed the pages.
+- The last revision of each tracked page is looked up 50 pages per request
+  instead of one page per request, which makes =git push= to a wiki with many
+  tracked pages far less chatty.
+- Only a real =editconflict= (and friends) is reported as a non-fast-forward;
+  other API errors are reported as themselves instead of being disguised as
+  push conflicts.
+- Namespace id =0= is cached correctly (the Perl version stores =(Main)= as
+  "not a namespace").
+- =git ls-remote mw::<url>= works: a remote named by URL is sanitized before
+  being used inside ref names.
+- =option verbosity= is honoured, so =git clone -q= is actually quiet.
+- Both API =formatversion= 1 and 2 answers, and both the old
+  =query-continue= and the current =continue= styles, are understood.  Page
+  content is requested through =rvslots=, as required since MediaWiki 1.32.
+- Everything in [[Speed]]: the ~by_allrev~ default strategy, connection reuse,
+  gzip, and API high limits.  git-remote-mediawiki always lists revisions one
+  page per request.
+- Self-signed certificates are handled through git's own configuration
+  rather than Perl's =HTTPS_CA_FILE= and =PERL_LWP_SSL_VERIFY_HOSTNAME=.
+
+* Limitations
+
+- MediaWiki has no branches: only =master= is pushed and fetched, and forced
+  pushes are refused.
+- MediaWiki capitalizes the first letter of a page name in most namespaces, so
+  a new file =foo.mw= pushed to the wiki comes back as =Foo.mw= on the next
+  fetch.
+- Renames are exported as a delete plus an add.
+- A file whose name has no =.mw= extension is treated as a media file to
+  upload.
+
+* Tests
+
+The test suite runs real =git clone=, =git pull= and =git push= against an
+in-process fake MediaWiki API (=tests/fake_mediawiki.py=), so no wiki and no
+network are needed:
+
+#+begin_src shell
+  python3 -m unittest discover -s tests -t . -v
+#+end_src
+
+The fake wiki is also runnable on its own for manual poking:
+
+#+begin_src shell
+  python3 tests/fake_mediawiki.py 8000 &
+  git clone mw::http://127.0.0.1:8000/w wiki
+#+end_src
+
+* License
+
+GPL v2 or later, as the Perl implementation this is derived from.
