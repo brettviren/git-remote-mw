@@ -160,6 +160,108 @@ the page content with =[[Category:Deleted]]=, since deletion needs privileges
 most users do not have.  Media files, on the other hand, are really deleted
 (and that will fail without the privilege).
 
+* Gateway to an ordinary git host
+
+A repository can have a =mw::= remote /and/ an ordinary one, and so act as a
+gateway between a wiki and, say, GitHub: wiki edits flow out as commits,
+commits pushed to GitHub flow back in as wiki edits.  This works, and the
+recipe below is exercised by =TestGateway= in the test suite, but it needs one
+thing done deliberately: the wiki bookkeeping has to travel with the mirror.
+
+** What has to travel
+
+Two refs hold everything the helper knows about the wiki, and neither is
+pushed or fetched by default:
+
+| =refs/mediawiki/<remote>/master= | the newest commit that is known to be on the wiki |
+| =refs/notes/<remote>/mediawiki=  | which MediaWiki revision each commit became        |
+
+A clone that lacks them thinks it has never talked to the wiki.  Its next
+=git push= to the wiki then says "no common ancestor, pushing complete
+history" and re-exports /every commit of the history/ as a fresh wiki edit:
+hundreds of pointless revisions on the wiki, each one restoring old content.
+Do not let that happen; if it does, the wiki's own history is the only undo.
+
+Note also that both ref names contain the remote's name, so the wiki remote
+has to be called the same thing in every clone.  =wiki= is a better choice
+than =origin= here, since =origin= will be the git host.
+
+** Setting up the gateway
+
+#+begin_src shell
+  mkdir wiki-gateway && cd wiki-gateway
+  git init
+  git remote add wiki mw::https://example.com/w      # plus mwLogin, see above
+  git pull wiki master
+  git branch --set-upstream-to=wiki/master master
+
+  git remote add hub git@github.com:me/my-wiki.git
+  git push hub master
+#+end_src
+
+** Keeping it in sync
+
+Wiki to the host, and the wiki state along with it.  The =wiki-state= branch is
+just the private ref parked somewhere every git host accepts:
+
+#+begin_src shell
+  git pull --rebase wiki master
+  git push hub master
+  git push hub 'refs/notes/*:refs/notes/*'
+  git push hub +refs/mediawiki/wiki/master:refs/heads/wiki-state
+#+end_src
+
+The host back to the wiki.  Merge rather than rebase, so that the commits the
+mirror already published keep their identity and the mirror never needs a
+forced push:
+
+#+begin_src shell
+  git pull --no-rebase hub master
+  git push wiki master
+#+end_src
+
+There is no echo between the two: a push to the wiki records the revision ids
+it created, so the following fetch has nothing new to import, and a fetch from
+the wiki leaves the local branch equal to the private ref, so the following
+push has nothing to send.  Leave =dumbPush= off (the default) for this reason;
+with =dumbPush=true= every push has to be re-imported, which rewrites the
+commits you just published and forces the mirror to be force-pushed.
+
+** Pushing to the wiki from a clone of the mirror
+
+Contributors who only clone the mirror can edit and open pull requests without
+any of this.  If such a clone should push to the wiki /itself/, give it the
+metadata first:
+
+#+begin_src shell
+  git clone git@github.com:me/my-wiki.git && cd my-wiki
+  git remote add wiki mw::https://example.com/w
+  git fetch origin 'refs/notes/*:refs/notes/*'
+  git update-ref refs/mediawiki/wiki/master refs/remotes/origin/wiki-state
+#+end_src
+
+Those two lines are the whole difference between an incremental push and a
+re-export of the entire history.  Fetching the notes alone is not enough: the
+resume point is the note /on/ the commit that =refs/mediawiki/wiki/master=
+points at, so the state ref is what makes the notes findable.
+
+** Caveats
+
+- Only =master= is synchronized: MediaWiki has no branches, so feature
+  branches live on the git host only and have to be merged into =master=
+  before they can reach the wiki.
+- One commit pushed to the wiki becomes one edit per changed page, attributed
+  to the wiki account the gateway logs in as, not to the commit's author.  The
+  commit subject becomes the edit summary.
+- Going the other way, one wiki revision becomes one commit, so a busy wiki
+  produces a lot of small commits on the mirror.
+- Two people pushing to the wiki through different clones is fine, but they
+  each need their own metadata kept up to date, and whoever is behind gets an
+  honest non-fast-forward rejection.  A single gateway repository, with the
+  host used for review and mirroring, is much less trouble.
+- The mirror is a git repository, not a wiki: nothing on GitHub renders
+  =.mw= wikitext or resolves =[[links]]=.
+
 * Speed
 
 Fetching is entirely dominated by the number of API round trips, each of which
@@ -217,6 +319,10 @@ plainly broken:
   "not a namespace").
 - =git ls-remote mw::<url>= works: a remote named by URL is sanitized before
   being used inside ref names.
+- A push falls back to =refs/mediawiki/<remote>/master= when git's
+  remote-tracking ref is missing, instead of taking the whole history to be
+  unexported.  The Perl version misreads the missing ref as a sha1 and dies
+  with =fatal: bad revision=.  See [[*Gateway to an ordinary git host]].
 - =option verbosity= is honoured, so =git clone -q= is actually quiet.
 - Both API =formatversion= 1 and 2 answers, and both the old
   =query-continue= and the current =continue= styles, are understood.  Page

@@ -213,6 +213,15 @@ def git_config_list(key: str) -> list[str]:
     return [item for item in raw.split() if item]
 
 
+def git_rev_parse(ref: str) -> str:
+    """The sha1 a ref resolves to, or "" if it does not resolve.
+
+    Plain `git rev-parse <ref>' echoes its argument back on stdout when the
+    ref is missing, which is no use to us; --verify --quiet says nothing.
+    """
+    return git(["rev-parse", "--verify", "--quiet", ref], quiet_stderr=True).strip()
+
+
 def git_credential(cred: dict[str, str], operation: str = "fill") -> dict[str, str]:
     """Talk to git's credential API."""
     request = "".join(f"{k}={v}\n" for k, v in cred.items() if v) + "\n"
@@ -1613,11 +1622,15 @@ class Helper:
         last_remote_revid = self.get_last_remote_revision()
         mw_revision = last_remote_revid
 
-        # sha1 of the commit pointed to by local HEAD, and by the remote ref.
-        head_sha1 = git(["rev-parse", local], quiet_stderr=True).strip()
-        remote_sha1 = git(
-            ["rev-parse", f"refs/remotes/{self.refname}/master"], quiet_stderr=True
-        ).strip()
+        head_sha1 = git_rev_parse(local)
+        # The newest commit known to be on the wiki: git's remote-tracking ref
+        # or, failing that, the private ref revisions are imported into.  A
+        # repository cloned from a mirror of this one (see the gateway section
+        # of README.org) may only have the latter, and mistaking that for "no
+        # common ancestor" would re-export the whole history to the wiki.
+        remote_sha1 = git_rev_parse(f"refs/remotes/{self.refname}/master") or (
+            git_rev_parse(f"refs/mediawiki/{self.refname}/master")
+        )
 
         if 0 < last_local_revid < last_remote_revid:
             return self.error_non_fast_forward(remote)

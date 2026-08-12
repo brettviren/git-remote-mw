@@ -641,6 +641,113 @@ class TestLogin(WikiTestCase):
         self.assertIn(b"Failed to log in mediawiki user", proc.stderr)
 
 
+class TestGateway(WikiTestCase):
+    """The wiki <-> plain-git-host gateway of README.org.
+
+    A gateway repository has the wiki as one remote and an ordinary git host
+    as another; clones made from the mirror can push to the wiki too, provided
+    they get the wiki metadata.
+    """
+
+    def gateway(self) -> Path:
+        """A repository with the wiki as a remote named "wiki"."""
+        repo = self.tmp / "gateway"
+        repo.mkdir()
+        self.git("init", "-q", cwd=repo)
+        self.git("remote", "add", "wiki", f"mw::{self.url}", cwd=repo)
+        self.git("pull", "-q", "wiki", "master", cwd=repo)
+        return repo
+
+    def mirror(self, repo: Path, name: str = "hub.git") -> Path:
+        """A bare repository standing in for GitHub, with the metadata."""
+        hub = self.tmp / name
+        self.git("init", "-q", "--bare", str(hub))
+        self.git("remote", "add", "hub", str(hub), cwd=repo)
+        self.push_to_mirror(repo)
+        return hub
+
+    def push_to_mirror(self, repo: Path) -> None:
+        self.git("push", "-q", "hub", "master", cwd=repo)
+        self.git("push", "-q", "hub", "refs/notes/*:refs/notes/*", cwd=repo)
+        self.git(
+            "push", "-q", "hub",
+            "+refs/mediawiki/wiki/master:refs/heads/wiki-state",
+            cwd=repo,
+        )
+
+    def from_mirror(self, hub: Path, name: str, restore: bool = True) -> Path:
+        repo = self.tmp / name
+        self.git("clone", "-q", str(hub), str(repo))
+        self.git("remote", "add", "wiki", f"mw::{self.url}", cwd=repo)
+        if restore:
+            self.git("fetch", "-q", "origin", "refs/notes/*:refs/notes/*", cwd=repo)
+            self.git(
+                "update-ref", "refs/mediawiki/wiki/master",
+                "refs/remotes/origin/wiki-state", cwd=repo,
+            )
+        return repo
+
+    def revision_count(self) -> int:
+        return sum(len(page["revisions"]) for page in self.wiki.pages.values())
+
+    def test_mirror_carries_the_metadata(self):
+        repo = self.gateway()
+        hub = self.mirror(repo)
+        refs = self.out("for-each-ref", "--format=%(refname)", cwd=hub).splitlines()
+        self.assertIn("refs/heads/master", refs)
+        self.assertIn("refs/heads/wiki-state", refs)
+        self.assertIn("refs/notes/wiki/mediawiki", refs)
+
+    def test_clone_of_the_mirror_pushes_incrementally(self):
+        hub = self.mirror(self.gateway())
+        repo = self.from_mirror(hub, "second")
+        before = self.revision_count()
+        (repo / "Sandbox.mw").write_text("Edited from the mirror clone.\n")
+        self.commit_all(repo, "edit from the mirror clone")
+        self.git("push", "-q", "wiki", "master:refs/heads/master", cwd=repo)
+        self.assertEqual(self.revision_count(), before + 1)
+        self.assertEqual(self.latest("Sandbox"), "Edited from the mirror clone.\n")
+
+    def test_clone_of_the_mirror_without_metadata_re_exports(self):
+        # The hazard the README warns about: with no wiki metadata, the whole
+        # history is exported again, one wiki edit per commit.
+        hub = self.mirror(self.gateway())
+        repo = self.from_mirror(hub, "naive", restore=False)
+        before = self.revision_count()
+        proc = self.git("push", "wiki", "master:refs/heads/master", cwd=repo)
+        self.assertIn(b"no common ancestor", proc.stderr)
+        self.assertGreater(self.revision_count(), before + 1)
+
+    def test_round_trip_through_the_mirror(self):
+        repo = self.gateway()
+        hub = self.mirror(repo)
+
+        # Somebody clones the mirror and edits there.
+        contrib = self.tmp / "contrib"
+        self.git("clone", "-q", str(hub), str(contrib))
+        (contrib / "Sandbox.mw").write_text("Edited through the mirror.\n")
+        self.commit_all(contrib, "mirror contribution")
+        self.git("push", "-q", "origin", "master", cwd=contrib)
+
+        # The gateway forwards it to the wiki.
+        self.git("pull", "-q", "--no-rebase", "hub", "master", cwd=repo)
+        self.git("push", "-q", "wiki", "master:refs/heads/master", cwd=repo)
+        self.assertEqual(self.latest("Sandbox"), "Edited through the mirror.\n")
+
+        # An edit made on the wiki goes the other way, and the mirror stays
+        # fast-forward: no force needed.
+        self.wiki.edit("Main Page", "Edited on the wiki.\n", comment="web edit")
+        self.git("pull", "-q", "--rebase", "wiki", "master", cwd=repo)
+        self.assertEqual((repo / "Main_Page.mw").read_text(), "Edited on the wiki.\n")
+        self.git("push", "-q", "hub", "master", cwd=repo)
+
+        # And no echo: a second round trip has nothing to do.
+        before = self.revision_count()
+        self.git("pull", "-q", "--rebase", "wiki", "master", cwd=repo)
+        self.git("push", "-q", "wiki", "master:refs/heads/master", cwd=repo)
+        self.assertEqual(self.revision_count(), before)
+
+
 class TestHelperProtocol(WikiTestCase):
     """Drive the helper by hand, the way git does."""
 
