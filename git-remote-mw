@@ -509,6 +509,7 @@ class MediaWiki:
     TRANSIENT = (429, 500, 502, 503, 504)
 
     def __init__(self, url: str, transport: Transport | None = None):
+        self._creds = None
         url = url.rstrip("/")
         if url.endswith("/api.php"):
             self.api_url = url
@@ -534,7 +535,36 @@ class MediaWiki:
         return status, body
 
     def api(self, params: dict, post: bool = False) -> dict:
-        """One API call.  Raises MWError on an API level error."""
+        """One API call, with re-login on session loss and backoff on
+        transient errors. Re-raises the last MWError when retries run out."""
+        last: MWError | None = None
+        for attempt in range(5):
+            try:
+                return self._api_once(params, post)
+            except MWError as exc:
+                last = exc
+                # Session lost mid-run: wiki now treats us as anonymous.
+                if exc.code in ("readapidenied", "notloggedin", "assertuserfailed") \
+                        and getattr(self, "_creds", None):
+                    warn(f"session lost ({exc.code}); re-logging in")
+                    name, password, domain = self._creds
+                    self.cookies = http.cookiejar.CookieJar()  # fresh session
+                    if hasattr(self, "_csrf"):
+                        self._csrf = None  # edit token is session-bound
+                    self.login(name, password, domain)
+                    continue
+                # Transient server/network trouble: back off and retry.
+                if attempt < 4 and (exc.code.startswith("http-5")
+                                    or exc.code == "unparseable"):
+                    warn(f"API error {exc.code}: {exc.info}; "
+                         f"retrying in {5 * (attempt + 1)}s")
+                    time.sleep(5 * (attempt + 1))
+                    continue
+                raise   # anything else: fail immediately, MWError intact
+        raise last  # retries exhausted: propagate the original MWError
+
+    def _api_once(self, params: dict, post: bool = False) -> dict:
+        """One raw API call. Raises MWError on an API level error."""
         query = {}
         for key, value in params.items():
             if value is None or value is False:
@@ -598,6 +628,7 @@ class MediaWiki:
 
     def login(self, name: str, password: str, domain: str = "") -> None:
         """Log in, raising MWError if the wiki says no."""
+        self._creds =  (name, password, domain)
         try:
             token = self.token("login")
         except MWError:
