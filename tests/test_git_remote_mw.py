@@ -153,7 +153,9 @@ class TestClone(WikiTestCase):
         head = self.out("rev-parse", "HEAD", cwd=repo)
         proc = self.git("pull", cwd=repo)
         self.assertEqual(self.out("rev-parse", "HEAD", cwd=repo), head)
-        self.assertIn(b"up to date", proc.stdout + proc.stderr)
+        # tolerant of git's older and newer spellings:
+        out = proc.stdout + proc.stderr
+        self.assertRegex(out, rb"up[- ]to[- ]date")
 
     def test_clone_quiet(self):
         # option verbosity 0 silences our progress reports.
@@ -443,7 +445,9 @@ class TestPush(WikiTestCase):
         )
         # The pushed revision is recorded, so a fetch has nothing to do.
         proc = self.git("pull", cwd=repo)
-        self.assertIn(b"up to date", proc.stdout + proc.stderr)
+        # tolerant of git's older and newer spellings:
+        out = proc.stdout + proc.stderr
+        self.assertRegex(out, rb"up[- ]to[- ]date")
 
     def test_push_new_page_and_deletion(self):
         repo = self.clone()
